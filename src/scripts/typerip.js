@@ -1,5 +1,6 @@
 import axios from 'axios';
 import saveAs from 'file-saver';
+import JSZip from 'jszip';
 import 'https://unpkg.com/wawoff2@2.0.1/build/decompress_binding.js';
 
 export default class TypeRip {
@@ -246,10 +247,20 @@ export default class TypeRip {
     }
 
     static async downloadFontsAsZip(fonts, zipfile_name){
-        for(var i = 0; i < fonts.length; i++) {
-            var file = await this.getFontFile(fonts[i])
-            saveAs(new Blob([file]), fonts[i].name + ".ttf");
+        if (fonts.length === 1) {
+            var file = await this.getFontFile(fonts[0]);
+            saveAs(new Blob([file]), fonts[0].name + ".ttf");
+            return;
         }
+
+        const zip = new JSZip();
+        for(var i = 0; i < fonts.length; i++) {
+            var file = await this.getFontFile(fonts[i]);
+            zip.file(fonts[i].name + ".ttf", file);
+        }
+        
+        const content = await zip.generateAsync({ type: "blob" });
+        saveAs(content, (zipfile_name || "fonts") + ".zip");
     }
 
     static async convertWoff2ToTTF(woff2Uint8Array) {
