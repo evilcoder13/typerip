@@ -5,10 +5,10 @@ import 'https://unpkg.com/wawoff2@2.0.1/build/decompress_binding.js';
 
 export default class TypeRip {
     static CORSProxies = [
-        "https://thingproxy.freeboard.io/fetch/", // Returns 404 when Adobe Fonts sends a 404
-        "https://api.allorigins.win/raw?url=", // Returns a 200 when Adobe Fonts sends a 404
-        "https://api.codetabs.com/v1/proxy/?quest=", // Returns a 200 when Adobe Fonts sends a 404
-        "https://corsproxy.io/?", // Adobe Fonts sends a 404 through this one even when the URL is valid. Did Adobe blacklist this one?
+        "https://typerip-cors-proxy.damneddevil.workers.dev/?url=",
+        "https://api.allorigins.win/raw?url=",
+        "https://api.codetabs.com/v1/proxy/?quest=",
+        "https://corsproxy.io/?url=",
     ];
 
     static Messages = Object.freeze({
@@ -46,47 +46,58 @@ export default class TypeRip {
     }
 
     static getNetworkResource(url_) {
-        let last_working_cors_proxy_index = parseInt(localStorage.getItem("cors_proxy_index"))
-        if (last_working_cors_proxy_index == null || last_working_cors_proxy_index >= this.CORSProxies.length) {
-            last_working_cors_proxy_index = 0
+        let storedIndex = parseInt(localStorage.getItem("cors_proxy_index"), 10);
+        let last_working_cors_proxy_index = (Number.isInteger(storedIndex) && storedIndex >= 0 && storedIndex < this.CORSProxies.length)
+            ? storedIndex
+            : 0;
+
+        let re_ordered_cors_proxies = [...this.CORSProxies];
+        if (last_working_cors_proxy_index > 0) {
+            let primary = re_ordered_cors_proxies.splice(last_working_cors_proxy_index, 1)[0];
+            re_ordered_cors_proxies.unshift(primary);
         }
 
-        let re_ordered_cors_proxies = [...this.CORSProxies]
-        re_ordered_cors_proxies.splice(last_working_cors_proxy_index, 1)
-        re_ordered_cors_proxies.unshift(this.CORSProxies[last_working_cors_proxy_index])
+        function try_all_proxies_until_success(proxy_index, proxy_list) {
+            let proxy = proxy_list[proxy_index];
+            let proxyUrl = proxy.includes('?') ? proxy + encodeURIComponent(url_) : proxy + url_;
 
-        function try_all_proxies_until_success(proxy_index, proxy_list){
-            let proxy = re_ordered_cors_proxies[proxy_index];
             return new Promise(function(resolve, reject) {
-                axios.get(proxy + url_)
+                console.log(`[TypeRip] Trying proxy [${proxy_index + 1}/${proxy_list.length}]: ${proxy}`);
+
+                axios.get(proxyUrl, {
+                    timeout: 10000,
+                    responseType: 'text'
+                })
                 .then((response) => {
-                    localStorage.setItem("cors_proxy_index", TypeRip.CORSProxies.indexOf(proxy));
-                    console.log("Succesful proxy: " + proxy)
+                    if (!response || !response.data || typeof response.data !== 'string' || response.data.trim().length === 0) {
+                        throw new Error(`Empty or invalid response from proxy: ${proxy}`);
+                    }
+
+                    // Save the successfully working index in original CORSProxies list
+                    let originalIndex = TypeRip.CORSProxies.indexOf(proxy);
+                    if (originalIndex !== -1) {
+                        localStorage.setItem("cors_proxy_index", originalIndex.toString());
+                    }
+                    console.log(`[TypeRip] Successful proxy: ${proxy} (HTTP ${response.status})`);
                     resolve(response);
                 })
                 .catch((error) => {
-                    
-                    // Don't check for 404 at this stage because some CORS proxies return a 404,
-                    // even if the Adobe Fonts URL is valid.
-
-                    // if (error.response){
-                    //     if (error.response.status == 404) {
-                    //         return reject(error);
-                    //     }
-                    // }
+                    let status = error.response ? error.response.status : 'No response';
+                    let code = error.code || 'N/A';
+                    console.warn(`[TypeRip] Proxy failed: ${proxy} | Status: ${status} | Code: ${code} | Message: ${error.message}`);
 
                     if (proxy_index + 1 >= proxy_list.length) {
-                        reject({message: TypeRip.Messages.AllProxiesFailed + " (#007)"})
-                    }else {
+                        reject({ message: TypeRip.Messages.AllProxiesFailed + " (#007)" });
+                    } else {
                         try_all_proxies_until_success(proxy_index + 1, proxy_list)
-                        .then(resolve)
-                        .catch(reject);
+                            .then(resolve)
+                            .catch(reject);
                     }
                 });
-            })
+            });
         }
 
-        return try_all_proxies_until_success(0, re_ordered_cors_proxies)
+        return try_all_proxies_until_success(0, re_ordered_cors_proxies);
     }
 
     //TODO: refactor this so that it returns a Promise instead of manually specifying a 'callback_' method.
@@ -267,13 +278,30 @@ export default class TypeRip {
         const loadScript = (src) => new Promise((onload) => document.documentElement.append(
             Object.assign(document.createElement('script'), {src, onload})
           ));
-        if (!window.Module) {
-            const path = 'https://unpkg.com/wawoff2@2.0.1/build/decompress_binding.js'
-            const init = new Promise((done) => window.Module = { onRuntimeInitialized: done});
-            await loadScript(path).then(() => init);
+        if (!window.Module || typeof window.Module.decompress !== 'function') {
+            const path = 'https://unpkg.com/wawoff2@2.0.1/build/decompress_binding.js';
+            const init = new Promise((done) => {
+                if (window.Module) {
+                    window.Module.onRuntimeInitialized = done;
+                } else {
+                    window.Module = { onRuntimeInitialized: done };
+                }
+            });
+            await loadScript(path);
+            if (typeof window.Module.decompress !== 'function') {
+                await init;
+            }
         }
 
-        return Module.decompress(woff2Uint8Array)
+        const decompressed = window.Module.decompress(woff2Uint8Array);
+        if (!decompressed) {
+            throw new Error("Failed to decompress WOFF2 font.");
+        }
+
+        // Module.decompress returns a Uint8Array view into Emscripten's WASM HEAP.
+        // If we don't slice/clone it, subsequent font decompressions or memory shifts
+        // will overwrite/corrupt previously decompressed font data in JSZip.
+        return new Uint8Array(decompressed);
     }
 
     static async getFontFile(font) {
